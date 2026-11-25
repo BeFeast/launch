@@ -153,18 +153,18 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("Set LAUNCH_POLICY in launch/instance.env or the environment", error)
 
     def test_model_choice_and_one_receipt_line_per_launch(self):
-        first = self.pick(app="sample-app", change="c-1")
+        first = self.pick(app="okilum", change="c-1")
         self.assertEqual(first["pool"], "cursor")
         self.assertEqual(
             first["target"],
             {"providerInstanceId": "cursor", "model": "grok-4.7", "options": {"reasoning_effort": "medium"}},
         )
-        second = self.pick(app="sample-app", change="c-2", role="mechanical", tier="mechanical")
+        second = self.pick(app="okilum", change="c-2", role="mechanical", tier="mechanical")
         self.assertEqual(second["target"]["providerInstanceId"], "cursor")
         rows = self.receipts()
         self.assertEqual(len(rows), 2)
         self.assertEqual([(r["project"], r["change"], r["stage"]) for r in rows],
-                         [("sample-app", "c-1", "launched"), ("sample-app", "c-2", "launched")])
+                         [("okilum", "c-1", "launched"), ("okilum", "c-2", "launched")])
 
     def test_skips_unenabled_rows_and_respects_tier_and_role(self):
         self.set_models([
@@ -183,15 +183,15 @@ class LaunchTests(unittest.TestCase):
         # Installation recording does not need a model policy or a T3 connection.
         policy = self.policy.read_text()
         self.policy.unlink()
-        self.assertEqual(self.run_cli("receipt", "installed", "--app", "sample-app", "--change", sha,
-                                      "--by", "maintainer", "--evidence", evidence), "")
+        self.assertEqual(self.run_cli("receipt", "installed", "--app", "okilum", "--change", sha,
+                                      "--by", "m4tick", "--evidence", evidence), "")
         self.policy.write_text(policy)
-        m4 = self.pick("--size", "S", app="sample-app", change=sha, role="mechanical", tier="mechanical")
+        m4 = self.pick("--size", "S", app="okilum", change=sha, role="mechanical", tier="mechanical")
         watcher = self.pick("--size", "M", tier="standard")
         installed, *launches = self.receipts()
         self.assertIsNotNone(datetime.fromisoformat(installed.pop("at")).tzinfo)
-        self.assertEqual(installed, {"project": "sample-app", "stage": "installed", "change": sha,
-                                     "by": "maintainer", "evidence": [evidence]})
+        self.assertEqual(installed, {"project": "okilum", "stage": "installed", "change": sha,
+                                     "by": "m4tick", "evidence": [evidence]})
         self.assertEqual([r["launch_id"] for r in launches], [m4["launch_id"], watcher["launch_id"]])
         self.assertEqual(m4["target"], watcher["target"])
 

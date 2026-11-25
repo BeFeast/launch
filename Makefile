@@ -12,9 +12,14 @@ CONFIG_DIR ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)
 
 install:
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(CONFIG_DIR)/systemd/user"
-	@if [ -n "$(INSTANCE_CONFIG)" ]; then \
-		install -d -m 700 "$(DESTDIR)$(CONFIG_DIR)/launch"; \
-		install -m 600 "$(INSTANCE_CONFIG)" "$(DESTDIR)$(CONFIG_DIR)/launch/instance.env"; \
+	@set -eu; \
+	instance="$(DESTDIR)$(CONFIG_DIR)/launch/instance.env"; \
+	if [ -n "$(INSTANCE_CONFIG)" ] && [ ! -e "$$instance" ] && [ ! -L "$$instance" ]; then \
+		install -d -m 700 "$$(dirname "$$instance")"; \
+		tmp="$$(mktemp "$$instance.XXXXXX")"; \
+		trap 'rm -f -- "$$tmp"' EXIT; \
+		install -m 600 "$(INSTANCE_CONFIG)" "$$tmp"; \
+		if ! ln -T -- "$$tmp" "$$instance"; then [ -e "$$instance" ] || [ -L "$$instance" ]; fi; \
 	fi
 	install -m 755 bin/launch bin/launch-schedule "$(DESTDIR)$(PREFIX)/bin/"
 	install -m 644 systemd/launch-schedule.service systemd/launch-schedule.timer "$(DESTDIR)$(CONFIG_DIR)/systemd/user/"

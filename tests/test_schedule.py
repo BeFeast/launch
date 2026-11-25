@@ -32,8 +32,8 @@ class ScheduleTests(unittest.TestCase):
         (self.root / "prompts/daily.txt").write_text("Do the daily thing.\nLine two.")
         (self.root / "prompts/night.txt").write_text("Night run.")
         (self.root / "schedule.yaml").write_text(json.dumps({"jobs": [
-            {"name": "daily", "time": "09:00", "app": "sample-app", "thread": "thread-a", "prompt_file": "prompts/daily.txt"},
-            {"name": "night", "time": "03:00", "app": "second-app", "thread": "thread-b", "fresh": True,
+            {"name": "daily", "time": "09:00", "app": "okilum", "thread": "thread-a", "prompt_file": "prompts/daily.txt"},
+            {"name": "night", "time": "03:00", "app": "toroid", "thread": "thread-b", "fresh": True,
              "prompt_file": "prompts/night.txt", "tier": "standard"},
         ]}))
         launch = self.root / "launch"
@@ -107,7 +107,7 @@ class ScheduleTests(unittest.TestCase):
                                                      "options": [{"id": "reasoningEffort", "value": "medium"}]})
         self.assertEqual(payload["dispatchMode"], {"type": "queue_after_active"})
         self.assertNotIn("freshContext", payload)
-        self.assertEqual(self.picks()[0]["argv"][:5], ["pick", "--app", "sample-app", "--change", "daily-2026-11-26"])
+        self.assertEqual(self.picks()[0]["argv"][:5], ["pick", "--app", "okilum", "--change", "daily-2026-11-26"])
         self.run_at("2026-11-26T09:02:00+02:00")
         self.run_at("2026-11-26T10:30:00+02:00")
         self.assertEqual(len(self.payloads), 1)
@@ -127,7 +127,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(self.payloads, [])
         self.assertEqual(self.picks(), [])
 
-    def test_deny_notifies_operator_and_ga_thread_once(self):
+    def test_deny_notifies_oleg_and_ga_thread_once(self):
         self.env["FAKE_PICK"] = json.dumps({"deny": "quota", "why": "codex: exhausted"})
         self.run_at("2026-11-26T09:00:10+02:00")
         self.run_at("2026-11-26T09:01:10+02:00")

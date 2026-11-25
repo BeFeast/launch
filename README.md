@@ -38,4 +38,4 @@ Pass `target` (`{providerInstanceId, model, options}`) to `delegate_task` with `
 - `launch-schedule --dry-run [--date YYYY-MM-DD]` prints the picks for a day (default tomorrow) using a copy of the receipts journal; it sends nothing.
 - Schedules use `LAUNCH_TIMEZONE` (an IANA zone name such as `Europe/London`, defaults to UTC). Both commands read `launch/instance.env` under `$XDG_CONFIG_HOME` (default `~/.config`). Environment variables take precedence. Use one literal `LAUNCH_KEY=value` assignment per line.
 - Overrides: `LAUNCH_SCHEDULE`, `LAUNCH_SCHEDULE_STATE`, `LAUNCH_BIN`, `LAUNCH_T3_ENV`, `LAUNCH_TG_ENV`, `LAUNCH_NOTIFY_THREAD`.
-- To install with an operator configuration, run `make install INSTANCE_CONFIG=/path/to/instance.env`. After checking `launch-schedule --dry-run`, reload the user systemd manager and enable the timer.
+- To seed a missing operator configuration during install, run `make install INSTANCE_CONFIG=/path/to/instance.env`. An existing instance configuration is preserved. After checking `launch-schedule --dry-run`, reload the user systemd manager and enable the timer.
