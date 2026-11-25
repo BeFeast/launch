@@ -1,0 +1,10 @@
+[Unit]
+Description=Start due scheduled T3 runs with a fresh launch pick
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -s %h/.local/bin/launch-schedule
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/launch/instance.env
+TimeoutStartSec=300

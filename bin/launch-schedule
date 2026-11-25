@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Run configured daily jobs in T3 threads, asking `launch pick` for a target right before each run."""
+import argparse, json, os, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request, uuid
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from pathlib import Path
+from time import monotonic
+from zoneinfo import ZoneInfo
+import yaml
+
+HOME, GRACE = Path.home(), timedelta(minutes=120)
+timezone_for_jobs = lambda: ZoneInfo(os.environ.get("LAUNCH_TIMEZONE", "UTC"))
+NS = uuid.uuid5(uuid.NAMESPACE_URL, "urn:befeast:launch-schedule:v1")
+env_path = lambda key, default: Path(os.environ.get(f"LAUNCH_{key}", default)).expanduser()
+def read_env(path):
+    return {k.strip(): v.strip().strip("\"'") for line in path.read_text(encoding="utf-8").splitlines()
+            if "=" in line and not line.lstrip().startswith("#") for k, v in (line.split("=", 1),)}
+def load_jobs():
+    path = env_path("SCHEDULE", HOME / ".config/launch/schedule.yaml")
+    if not path.is_file():
+        raise ValueError("schedule missing. Set LAUNCH_SCHEDULE in launch/instance.env or the environment")
+    jobs = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("jobs") or []
+    if len({job["name"] for job in jobs}) != len(jobs): raise ValueError("duplicate job names in schedule")
+    for job in jobs:
+        job["prompt"] = (path.parent / job["prompt_file"]).read_text(encoding="utf-8")
+        if not job["prompt"].strip() or not job.get("thread"):
+            raise ValueError(f"job {job['name']}: empty prompt or no thread")
+        job["at"] = dtime(*map(int, str(job["time"]).split(":")))
+    return jobs
+def pick(job, day, log_root=None):
+    cmd = [os.environ.get("LAUNCH_BIN", str(Path(__file__).with_name("launch"))), "pick", "--app", job["app"],
+           "--change", f"{job['name']}-{day}", "--role", job.get("role", "implementation"),
+           "--tier", job.get("tier", "strong"), "--risk", job.get("risk", "normal")]
+    env = dict(os.environ, **({"LAUNCH_LOG_ROOT": str(log_root)} if log_root else {}))
+    out = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    if out.returncode:
+        return {"deny": "error", "why": out.stderr.strip()[-300:] or f"launch pick exit {out.returncode}"}
+    return json.loads(out.stdout)
+def message(thread, text, key, target=None, fresh=False):
+    payload = {"type": "message.dispatch", "createdBy": "agent", "creationSource": "provider", "threadId": thread,
+               "commandId": str(uuid.uuid5(NS, key + ":command")), "messageId": str(uuid.uuid5(NS, key + ":message")),
+               "text": text, "attachments": [], "dispatchMode": {"type": "queue_after_active"}}
+    if target:
+        payload["modelSelection"] = {"instanceId": target["providerInstanceId"], "model": target["model"],
+                                     "options": [{"id": k, "value": v} for k, v in (target.get("options") or {}).items()]}
+    if fresh:
+        payload["freshContext"] = True
+    return payload
+def t3_dispatch(payload):
+    from websockets.sync.client import connect
+    vals = read_env(env_path("T3_ENV", HOME / ".config/t3/api-token.env"))
+    base, token = vals.get("T3_URL", "").rstrip("/"), vals.get("T3_TOKEN", "")
+    if not base.startswith(("http://", "https://")) or not token:
+        raise ValueError("T3_URL / T3_TOKEN missing in T3 env file")
+    try:
+        with connect("ws" + base[4:] + "/ws?orchestrationProtocol=2", additional_headers={"Authorization": f"Bearer {token}"},
+                     proxy=None, open_timeout=10, close_timeout=1) as ws:
+            ws.send(json.dumps({"_tag": "Request", "id": payload["commandId"], "tag": "orchestration.dispatchCommand",
+                                "headers": [], "payload": payload}))
+            deadline = monotonic() + 30
+            while True:
+                incoming = json.loads(ws.recv(timeout=max(0.1, deadline - monotonic())))
+                for msg in incoming if isinstance(incoming, list) else [incoming]:
+                    if msg.get("_tag") == "Ping":
+                        ws.send(json.dumps({"_tag": "Pong"}))
+                    elif str(msg.get("requestId")) == payload["commandId"] and msg.get("_tag") == "Exit":
+                        if (msg.get("exit") or {}).get("_tag") != "Success":
+                            raise ValueError("T3 rejected the dispatch")
+                        return
+    except ValueError:
+        raise
+    except Exception as error:  # library messages may echo handshake details; keep only the type
+        raise ValueError(f"T3 dispatch failed ({type(error).__name__})") from None
+def notify(text, key):
+    if os.environ.get("LAUNCH_TG_ENV"):
+        try:
+            env = read_env(env_path("TG_ENV", ""))
+            url = f"{os.environ.get('LAUNCH_TG_API', 'https://api.telegram.org')}/bot{env['TG_TOKEN']}/sendMessage"
+            with urllib.request.urlopen(url, urllib.parse.urlencode({"chat_id": env["TG_CHAT"], "text": text}).encode(), timeout=20) as r:
+                if not json.load(r).get("ok"):
+                    raise ValueError("ok=false")
+        except Exception as error:
+            print(f"launch-schedule: telegram failed ({type(error).__name__})", file=sys.stderr)
+    if thread := os.environ.get("LAUNCH_NOTIFY_THREAD"):
+        try:
+            t3_dispatch(message(thread, text, key + ":notify"))
+        except ValueError as error:
+            print(f"launch-schedule: T3 notification failed: {error}", file=sys.stderr)
+def run(now):
+    state_file = env_path("SCHEDULE_STATE", HOME / ".local/state/launch/schedule-state.json")
+    state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.is_file() else {}
+    local = now.astimezone(timezone_for_jobs())
+    for job in load_jobs():
+        for day in (local.date() - timedelta(days=1), local.date()):
+            slot = datetime.combine(day, job["at"], local.tzinfo)
+            key, prev = f"{job['name']}@{slot.isoformat()}", state.get(job["name"]) or {}
+            same = prev.get("slot") == key
+            if not slot <= local < slot + GRACE or same and prev.get("status") != "error":
+                continue
+            label = f"«{job['name']}» ({job['time']} {local.tzinfo}, {day})"
+            decision = {"target": prev["target"]} if same and prev.get("target") else pick(job, day)
+            if "deny" in decision:
+                status, text = "denied", f"launch-schedule: {label} не запущен — launch pick deny: {decision.get('why')}"
+            else:
+                try:
+                    t3_dispatch(message(job["thread"], job["prompt"], key, decision["target"], job.get("fresh", False)))
+                    status, text = "sent", None
+                except ValueError as error:
+                    status, text = "error", f"launch-schedule: {label} не отправлен в T3 ({error}); повторю до {(slot + GRACE):%H:%M}"
+            state[job["name"]] = {"slot": key, "status": status, "target": decision.get("target"),
+                                  "why": decision.get("why"), "at": now.isoformat()}
+            print(json.dumps({"job": job["name"], **state[job["name"]]}, ensure_ascii=False))
+            if text and not (same and status == "error"):
+                notify(text, f"{key}:{status}")
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            (tmp := state_file.with_suffix(".tmp")).write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, state_file)
+def dry_run(day):
+    with tempfile.TemporaryDirectory() as tmp:  # picks append receipts; keep the real journal untouched
+        receipts = env_path("LOG_ROOT", HOME / ".local/state/launch") / "receipts.jsonl"
+        if receipts.is_file():
+            shutil.copy(receipts, Path(tmp) / "receipts.jsonl")
+        for job in sorted(load_jobs(), key=lambda j: j["at"]):
+            d = pick(job, day, tmp)
+            print(json.dumps({"date": str(day), "time": job["time"], "job": job["name"], "thread": job["thread"],
+                              **{k: d[k] for k in ("deny", "pool", "target", "why") if k in d}}, ensure_ascii=False))
+def load_instance_config():
+    config = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "launch/instance.env"
+    if config.is_file():
+        for key, value in read_env(config).items():
+            if key.startswith("LAUNCH_"):
+                os.environ.setdefault(key, value)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="print the picks for --date without sending or recording")
+    parser.add_argument("--date", type=date.fromisoformat, help="dry-run date (default: tomorrow in the schedule time zone)")
+    parser.add_argument("--now", type=datetime.fromisoformat, help="override the current time (ISO, with offset)")
+    args = parser.parse_args()
+    now = args.now or datetime.now(timezone.utc)
+    try:
+        load_instance_config()
+        if args.dry_run:
+            dry_run(args.date or now.astimezone(timezone_for_jobs()).date() + timedelta(days=1))
+        else:
+            run(now)
+    except (OSError, ValueError, KeyError, yaml.YAMLError, subprocess.SubprocessError) as error:
+        print(f"launch-schedule: {error}", file=sys.stderr)
+        return 1
+    return 0
+if __name__ == "__main__":
+    sys.exit(main())

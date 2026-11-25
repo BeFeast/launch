@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+import argparse, json, os, re, sys, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+from pathlib import Path
+from uuid import uuid4
+import yaml
+
+HOME = Path.home()
+DEFAULT_LOG_ROOT = HOME / ".local/state/launch"
+DEFAULT_POLICY = HOME / ".config/launch/model-policy.yaml"
+DEFAULT_SNAPSHOT = DEFAULT_LOG_ROOT / "snapshot.json"
+DEFAULT_FEED = DEFAULT_LOG_ROOT / "quotas-live.json"
+DEFAULT_T3_ENV = HOME / ".config/t3/api-token.env"
+TIERS, ROLES = ("mechanical", "standard", "strong"), ("implementation", "review", "mechanical", "research")
+QUOTA_MAX_AGE, CLAUDE_WEEKLY_MIN, CLAUDE_WEEKLY_CAP, T3_HTTP_LIMIT = 1800, 0.50, 0.15, 16 * 1024 * 1024
+EFFORT_OPTIONS = {"codex": "reasoningEffort", "cursor": "reasoning_effort", "antigravity": "thought_level", "claudeAgent": "effort"}
+
+env_path = lambda key, default: Path(os.environ.get(f"LAUNCH_{key}", default)).expanduser()
+is_native_claude = lambda inst: str(inst).casefold().startswith(("claude", "anthropic"))
+receipts_path = lambda: env_path("LOG_ROOT", DEFAULT_LOG_ROOT) / "receipts.jsonl"
+def stamp(value):
+    try:
+        if isinstance(value, datetime):
+            return value
+        if type(value) in (int, float):
+            return datetime.fromtimestamp(value / 1000 if value > 1e12 else value, timezone.utc)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else None
+    except (AttributeError, ValueError, OverflowError, OSError):
+        return None
+def read_launches(now):
+    file = receipts_path()
+    if not file.is_file():
+        return []
+    cutoff = now - timedelta(days=7)
+    return [row for line in file.read_text(encoding="utf-8").splitlines() if line.strip()
+            and (row := json.loads(line)).get("stage") == "launched" and (stamp(row.get("at")) or now) >= cutoff]
+def append_receipt(row):
+    file = receipts_path()
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with file.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+def fresh(value, now, max_age=QUOTA_MAX_AGE):
+    observed = stamp(value)
+    return observed is not None and 0 <= (now - observed).total_seconds() <= max_age
+def read_quota(key, path, timestamp, now):
+    try:
+        data = json.loads(env_path(key, path).read_text(encoding="utf-8"))
+        return (data, "") if fresh(data.get(timestamp), now) else ({}, "stale")
+    except (OSError, ValueError, AttributeError):
+        return {}, "unavailable"
+def active_usage(snapshot, provider, now):
+    emails = {a["email"].strip().lower(): a for a in snapshot.get("proxy_auths", [])
+              if a.get("provider") == provider and a.get("email")}
+    auths = {**emails, **{sha256(f"oauth-account:{provider}:{e}".encode()).hexdigest()[:24]: a for e, a in emails.items()}}
+    for identity, entry in (snapshot.get(f"{provider}_usage") or {}).items():
+        data = entry.get("data") or {}
+        auth = auths.get(identity.lower(), auths.get(str(data.get("email", "")).lower()))
+        if (entry.get("ok") and fresh(entry.get("fetched_at"), now)
+                and (not auths or auth is not None and not (auth.get("disabled") or auth.get("status") == "disabled"))):
+            yield data
+def claude_windows(data, now):
+    for key in ("seven_day", "five_hour"):
+        win = data.get(key) or {}
+        used, reset = win.get("utilization"), stamp(win.get("resets_at") or win.get("reset_at"))
+        yield 1 - used / 100 if type(used) in (int, float) and 0 <= used <= 100 and (not reset or reset > now) else None
+def quota_remaining(quota, promo, now):
+    frac, status = quota.get("remaining_fraction"), quota.get("status")
+    max_age, reset = quota.get("max_age_seconds"), stamp(quota.get("reset_at"))
+    age_limit = min(max_age, QUOTA_MAX_AGE) if type(max_age) in (int, float) and max_age > 0 else QUOTA_MAX_AGE
+    if fresh(quota.get("observed_at"), now, age_limit) and (not reset or reset > now):
+        if status == "cooldown":
+            return 0
+        if status == "exhausted" or frac == 0:
+            return -1 if promo else 0
+        if status == "ok" and (frac is None or type(frac) in (int, float) and 0 < frac <= 1):
+            return frac if frac is not None else -1
+    # Verified availability without a comparable percentage ranks below measured headroom.
+    return -1 if promo else None
+def pick(args, now):
+    policy = env_path("POLICY", DEFAULT_POLICY)
+    if not policy.is_file():
+        raise ValueError("model policy missing. Set LAUNCH_POLICY in launch/instance.env or the environment")
+    worker = (yaml.safe_load(policy.read_text(encoding="utf-8")) or {})["worker_pool"]
+    allowed_tiers = set(TIERS[TIERS.index(args.tier):]) & set(worker["work"]["rebase" if args.role == "mechanical" else "feature"])
+    feed, feed_issue = read_quota("FEED", DEFAULT_FEED, "generated_at", now)
+    snapshot, _ = read_quota("SNAPSHOT", DEFAULT_SNAPSHOT, "generated", now)
+    providers = feed.get("providers")
+    if not isinstance(providers, dict):
+        providers, feed_issue = None, feed_issue or "unavailable"
+    reasons = [f"Zecori quota snapshot {feed_issue}; using policy order"] if feed_issue else []
+    codex_credits = any(c.get("has_credits") is True and not c.get("overage_limit_reached")
+                        and not (data.get("spend_control") or {}).get("reached")
+                        for data in active_usage(snapshot, "codex", now) if (c := data.get("credits")))
+    weekly, claude_remaining = None, 0
+    if args.risk == "high":
+        for data in active_usage(snapshot, "claude", now):
+            week, short = claude_windows(data, now)
+            if week is not None:
+                weekly = max(weekly or 0, week)
+                if week > CLAUDE_WEEKLY_MIN:
+                    claude_remaining = max(claude_remaining, min(week, short if short is not None else week))
+    candidates = []
+    for row in worker["models"]:
+        if row["tier"] not in allowed_tiers or row.get("status") not in (None, "enabled"):
+            continue
+        inst, model = row["instance"], row["model"]
+        pool = row.get("group", inst)
+        remaining, group, promo, label = 0, None, False, pool
+        if is_native_claude(inst):
+            pool = label = "claude"
+            if args.risk != "high":
+                continue
+            if weekly is None or weekly <= CLAUDE_WEEKLY_MIN:
+                reasons.append(f"claude: {'weekly unknown' if weekly is None else 'weekly <= 50%'}")
+                continue
+            launches = read_launches(now)
+            claude_7d = sum(is_native_claude((r.get("target") or {}).get("providerInstanceId", "")) for r in launches)
+            if (claude_7d + 1) / (len(launches) + 1) > CLAUDE_WEEKLY_CAP + 1e-9:
+                reasons.append("claude: weekly 15% cap")
+                continue
+            remaining = claude_remaining
+        elif providers is not None:
+            provider = {"grok": "xai", "muse": "meta"}.get(inst, inst)
+            prefix, _, _ = model.partition("/")
+            if pool == "ag-claude-gpt":
+                provider, group = "antigravity", "claude_gpt"
+            elif provider == "antigravity":
+                group = "gemini" if model.startswith("gemini-") else "claude_gpt"
+            elif prefix in ("ollama", "ollama-cloud", "cliproxy"):
+                provider = "ollama" if prefix != "cliproxy" else model
+            quota = providers.get(provider) or {}
+            quota = (quota.get("groups") or {}).get(group, {}) if group else quota
+            promo = provider == "codex" and codex_credits
+            remaining = quota_remaining(quota, promo, now)
+            if pool != "ag-claude-gpt" and (group or prefix in ("ollama", "ollama-cloud", "cliproxy")):
+                label = f"{pool}/{group or model}"
+        if providers is not None and remaining in (None, 0):
+            reasons.append(f"{label}: {'quota unknown' if remaining is None else 'exhausted'}")
+            continue
+        candidates.append((0 if providers is None else remaining, row, pool, label, promo))
+    if not candidates:
+        return {"deny": "quota", "why": ", ".join(dict.fromkeys(reasons)) or "no eligible model"}
+    remaining, row, pool, label, promo = max(candidates, key=lambda candidate: candidate[0])
+    inst, model = row["instance"], row["model"]
+    opt = EFFORT_OPTIONS.get(inst)
+    effort = ("high" if args.risk == "high"
+              else next((row[k] for k in (opt, "thought_level", "reasoningEffort", "effort") if k in row), "medium"))
+    options = {opt: effort} if opt else {k: row[k] for k in ("effort", "reasoningEffort") if k in row}
+    target = {"providerInstanceId": inst, "model": model, "options": options}
+    note = f"{remaining:.0%} remaining" if remaining > 0 else "selected"
+    if remaining == -1 and promo:
+        note = "promo credits available"
+    why = ", ".join([*dict.fromkeys(reasons), f"{label}: {note}"])
+    return {"launch_id": f"{args.app}-{args.change}-{uuid4().hex}", "pool": pool, "target": target, "why": why}
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise ValueError("unexpected HTTP redirect from T3")
+def t3_run(thread):
+    vals = read_env(env_path("T3_ENV", DEFAULT_T3_ENV))
+    base, tok = vals.get("T3_URL", "").rstrip("/"), vals.get("T3_TOKEN", "")
+    if not base.startswith(("http://", "https://")) or not tok:
+        raise ValueError("T3_URL / T3_TOKEN missing in T3 env file")
+    req = urllib.request.Request(f"{base}/api/orchestration/threads/{urllib.parse.quote(thread, safe='')}/bounded",
+                                 headers={"Authorization": f"Bearer {tok}", "x-t3-orchestration-protocol": "2", "Accept": "application/json"})
+    try:
+        with urllib.request.build_opener(_NoRedirect()).open(req, timeout=20) as resp:
+            raw = resp.read(T3_HTTP_LIMIT + 1)
+    except urllib.error.HTTPError as err:
+        err.close()
+        raise ValueError(f"T3 HTTP {err.code} for thread {thread}") from None
+    except OSError:
+        raise ValueError(f"T3 HTTP read failed for thread {thread}") from None
+    if len(raw) > T3_HTTP_LIMIT:
+        raise ValueError("T3 bounded response too large")
+    proj = json.loads(raw).get("projection") or {}
+    if (proj.get("thread") or {}).get("id") != thread:
+        raise ValueError(f"T3 returned a snapshot for a different thread than {thread}")
+    run = max(proj.get("runs") or [], key=lambda r: r.get("ordinal", 0), default=None)
+    if run is None:
+        raise ValueError(f"no T3 run for thread {thread}")
+    end, start = stamp(run.get("completedAt")), stamp(run.get("startedAt"))
+    if end is None or (start and start > end):
+        raise ValueError(f"T3 run {run['id']} has no valid completion time")
+    return {"run_id": run["id"], "status": run.get("status"), "started_at": start.isoformat() if start else None,
+            "ended_at": end.isoformat(), "model": run.get("executedModel") or (run.get("modelSelection") or {}).get("model"),
+            "agent_min": round((end - start).total_seconds() / 60, 3) if start else 0}
+def slug(value):
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", value):
+        raise argparse.ArgumentTypeError("expected a name containing letters, digits, dots, underscores or hyphens")
+    return value
+def nonempty(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("expected non-empty text")
+    return value
+def parse_args():
+    parser = argparse.ArgumentParser(description="Pick an explicit child model and record one launch receipt.")
+    cmds = parser.add_subparsers(dest="command", required=True)
+    p = cmds.add_parser("pick")
+    p.add_argument("--app", type=slug, required=True)
+    p.add_argument("--change", type=slug, required=True)
+    p.add_argument("--role", choices=ROLES, default="implementation")
+    p.add_argument("--tier", choices=TIERS, default="strong")
+    p.add_argument("--risk", choices=("normal", "high"), default="normal")
+    p.add_argument("--size", choices=("S", "M", "L"), help="accepted for compatibility; ignored")
+    receipt = cmds.add_parser("receipt", help="record installation evidence")
+    receipt.add_argument("stage", choices=("installed",))
+    receipt.add_argument("--app", type=slug, required=True)
+    receipt.add_argument("--change", type=slug, required=True)
+    receipt.add_argument("--by", type=nonempty, required=True)
+    receipt.add_argument("--evidence", type=nonempty, nargs="+", required=True)
+    d = cmds.add_parser("done")
+    d.add_argument("--thread", type=nonempty, required=True)
+    return parser.parse_args()
+def read_env(path):
+    return {k.strip(): v.strip().strip("\"'") for line in path.read_text(encoding="utf-8").splitlines()
+            if (s := line.strip()) and not s.startswith("#") and "=" in s for k, v in (s.split("=", 1),)}
+
+def load_instance_config():
+    config = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "launch/instance.env"
+    if config.is_file():
+        for key, value in read_env(config).items():
+            if key.startswith("LAUNCH_"):
+                os.environ.setdefault(key, value)
+
+def main():
+    args = parse_args()
+    try:
+        load_instance_config()
+        if args.command == "done":
+            print(json.dumps(t3_run(args.thread), ensure_ascii=False, allow_nan=False))
+            return 0
+        now = datetime.now(timezone.utc)
+        if args.command == "receipt":
+            append_receipt({"project": args.app, "stage": args.stage, "change": args.change,
+                            "at": now.isoformat(), "by": args.by, "evidence": args.evidence})
+            return 0
+        decision = pick(args, now)
+        append_receipt({"project": args.app, "change": args.change, "role": args.role, "tier": args.tier, "risk": args.risk,
+                        "stage": "denied" if "deny" in decision else "launched", "at": now.isoformat(), "by": "launch", **decision})
+        print(json.dumps(decision, ensure_ascii=False, allow_nan=False))
+    except (OSError, ValueError, KeyError, yaml.YAMLError) as error:
+        print(f"launch: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
